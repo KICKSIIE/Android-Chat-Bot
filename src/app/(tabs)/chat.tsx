@@ -1,4 +1,3 @@
-import * as DocumentPicker from 'expo-document-picker';
 import { SaveFormat, manipulateAsync } from 'expo-image-manipulator';
 import * as ImagePicker from 'expo-image-picker';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
@@ -9,6 +8,8 @@ import {
   Image,
   KeyboardAvoidingView,
   Modal,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   Platform,
   Pressable,
   StyleSheet,
@@ -46,8 +47,17 @@ type Message = {
   content: string;
   imageUri?: string; // local preview, only for photos sent in this session
   hasImage?: boolean; // photo sent earlier (loaded from the server)
-  fileName?: string;
 };
+
+
+const atBottomRef = useRef(true);
+
+const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+  const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
+  const distanceFromBottom =
+    contentSize.height - (contentOffset.y + layoutMeasurement.height);
+  atBottomRef.current = distanceFromBottom < 80; // within ~80px of the bottom
+}, []);
 
 type PendingImage = { uri: string; base64: string };
 
@@ -57,83 +67,90 @@ type Conversation = {
   updated_at: string;
 };
 
-type PendingFile = { name: string; base64: string };
-
 const toMessage = (m: any): Message => ({
   id: String(m.id),
   role: m.role,
   content: m.content,
   hasImage: !!m.has_image,
-  fileName: m.file_name || undefined,
 });
 
 // Memoized so that while a reply streams, only the bubble being updated re-renders.
-const MessageBubble = memo(function MessageBubble({
-  id, role, content, imageUri, hasImage, token, canSpeak, speaking, onSpeak, fileName,
-}: {
-  id: string;
-  role: Message['role'];
-  content: string;
-  imageUri?: string;
-  hasImage?: boolean;
-  token?: string | null;
-  canSpeak?: boolean;
-  speaking?: boolean;
-  onSpeak?: (id: string, text: string) => void;
-  fileName?: string;   // add this
-}) {
-  const remoteUri = hasImage && /^\d+$/.test(id) ? `${BACKEND_URL}/api/messages/${id}/image` : null;
-  return (
-    <ThemedView
-      type="backgroundElement"
-      style={[styles.bubble, role === 'user' ? styles.userBubble : styles.assistantBubble]}>
-      {imageUri ? (
-        <Image source={{ uri: imageUri }} style={styles.bubbleImage} />
-      ) : remoteUri && token ? (
-        <RemoteImage uri={remoteUri} token={token} />
-      ) : hasImage ? (
-        <ThemedText type="small">📷 Photo</ThemedText>
-      ) : null}
-      {fileName ? <ThemedText type="small">📄 {fileName}</ThemedText> : null}
-      {content ? <ThemedText type="small">{content}</ThemedText> : null}
-      {role === 'assistant' && canSpeak && content && onSpeak ? (
-      <Pressable onPress={() => onSpeak(id, content)} hitSlop={8} style={styles.speakButton}>
-        <ThemedText type="small">{speaking ? '⏹ Stop' : '🔊 Read aloud'}</ThemedText>
-      </Pressable>
-    ) : null}
-    </ThemedView>
-  );
+const MessageBubble = memo(
+  function MessageBubble({
+    id, role, content, imageUri, hasImage, token, canSpeak, speaking, onSpeak,
+  }: {
+    id: string;
+    role: Message['role'];
+    content: string;
+    imageUri?: string;
+    hasImage?: boolean;
+    token?: string | null;
+    canSpeak?: boolean;
+    speaking?: boolean;
+    onSpeak?: (id: string, text: string) => void;
+  }) {
+    const remoteUri = hasImage && /^\d+$/.test(id) ? `${BACKEND_URL}/api/messages/${id}/image` : null;
+    return (
+      <ThemedView
+        type="backgroundElement"
+        style={[styles.bubble, role === 'user' ? styles.userBubble : styles.assistantBubble]}>
+        {imageUri ? (
+          <Image source={{ uri: imageUri }} style={styles.bubbleImage} />
+        ) : remoteUri && token ? (
+          <RemoteImage uri={remoteUri} token={token} />
+        ) : hasImage ? (
+          <ThemedText type="small">📷 Photo</ThemedText>
+        ) : null}
+        {content ? <ThemedText type="small">{content}</ThemedText> : null}
+        {role === 'assistant' && canSpeak && content && onSpeak ? (
+          <Pressable onPress={() => onSpeak(id, content)} hitSlop={8} style={styles.speakButton}>
+            <ThemedText type="small">{speaking ? '⏹ Stop' : '🔊 Read aloud'}</ThemedText>
+          </Pressable>
+        ) : null}
+      </ThemedView>
+    );
+  },
+  (prev, next) =>
+    prev.id === next.id &&
+    prev.role === next.role &&
+    prev.content === next.content &&
+    prev.imageUri === next.imageUri &&
+    prev.hasImage === next.hasImage &&
+    prev.speaking === next.speaking &&
+    prev.token === next.token &&
+    prev.canSpeak === next.canSpeak,
+);
 
-  function RemoteImage({ uri, token }: { uri: string; token: string }) {
-    const [src, setSrc] = useState<string | null>(null);
-
-    useEffect(() => {
-      let cancelled = false;
-      (async () => {
-        try {
-          const r = await fetch(uri, {
-            headers: { Authorization: `Bearer ${token}`, 'ngrok-skip-browser-warning': 'true' },
-          });
-          if (!r.ok) throw new Error(`status ${r.status}`);
-          const blob = await r.blob();
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            if (!cancelled && typeof reader.result === 'string') setSrc(reader.result);
-          };
-          reader.readAsDataURL(blob);
-        } catch (e: any) {
-          console.warn('image load failed:', e.message);
+// Move this OUTSIDE MessageBubble
+const RemoteImage = memo(function RemoteImage({ uri, token }: { uri: string; token: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(uri, {
+          headers: { Authorization: `Bearer ${token}`, 'ngrok-skip-browser-warning': 'true' },
+        });
+        if (!r.ok) throw new Error(`status ${r.status}`);
+        const buf = await r.arrayBuffer();
+        // Convert bytes → base64 in JS, no native blob store round-trip.
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as any);
         }
-      })();
-      return () => {
-        cancelled = true;
-      };
-    }, [uri, token]);
+        const b64 = btoa(binary);
+        if (!cancelled) setSrc(`data:image/jpeg;base64,${b64}`);
+      } catch (e: any) {
+        console.warn('image load failed:', e.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [uri, token]);
 
-    if (!src) return <ThemedText type="small">📷 Photo</ThemedText>;
-    return <Image source={{ uri: src }} style={styles.bubbleImage} />;
-  }
-
+  if (!src) return <ThemedText type="small">📷 Photo</ThemedText>;
+  return <Image source={{ uri: src }} style={styles.bubbleImage} />;
 });
 
 export default function ChatScreen() {
@@ -146,28 +163,7 @@ export default function ChatScreen() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
-  const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
-const canSend = !!input.trim() || !!pendingImage || !!pendingFile;
 
-async function pickFile() {
-  try {
-    const res = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
-    if (res.canceled || !res.assets?.[0]) return;
-    const a = res.assets[0];
-    if (!/\.(pdf|docx|txt|md|csv|json)$/i.test(a.name)) {
-      Alert.alert('Unsupported file', 'Use PDF, DOCX, TXT, MD, CSV or JSON.');
-      return;
-    }
-    if ((a.size ?? 0) > 5 * 1024 * 1024) {
-      Alert.alert('File too large', 'Choose a file under 5 MB.');
-      return;
-    }
-    const base64 = await FileSystem.readAsStringAsync(a.uri, { encoding: FileSystem.EncodingType.Base64 });
-    setPendingFile({ name: a.name, base64 });
-  } catch (e: any) {
-    Alert.alert('Could not add file', e.message);
-  }
-}
   const [webSearch, setWebSearch] = useState(false);
   const listRef = useRef<FlatList<Message>>(null);
 
@@ -188,6 +184,7 @@ async function pickFile() {
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
+  const lastMessageId = messages[messages.length - 1]?.id;
 
   async function toggleRecording() {
     if (transcribing || sending || !token) return;
@@ -239,7 +236,8 @@ async function pickFile() {
         Alert.alert('Nothing heard', 'Try again and speak a little closer to the mic.');
         return;
       }
-      setInput((prev) => (prev ? `${prev} ${text}` : text));
+      const combined = input.trim() ? `${input.trim()} ${text}` : text;
+      sendMessage({ text: combined });
     } catch (e: any) {
       setRecording(false);
       Alert.alert('Voice input failed', e.message);
@@ -318,20 +316,21 @@ async function pickFile() {
   }, [token]);
 
   async function openConversation(id: number) {
-    if (!token) return;
-    setDrawerOpen(false);
-    if (id === conversationId) return;
-    abortStream();
-    const seq = ++loadSeqRef.current;
-    try {
-      setConversationId(id);
-      setMessages([]);
-      const msgs = await apiFetch(`/api/conversations/${id}/messages`, {}, token);
-      if (seq === loadSeqRef.current) setMessages(msgs.messages.map(toMessage));
-    } catch (e: any) {
-      console.warn('Failed to open conversation:', e.message);
-    }
+  if (!token) return;
+  setDrawerOpen(false);
+  if (id === conversationId) return;
+  abortStream();
+  atBottomRef.current = true;          // <-- new: force auto-scroll on load
+  const seq = ++loadSeqRef.current;
+  try {
+    setConversationId(id);
+    setMessages([]);
+    const msgs = await apiFetch(`/api/conversations/${id}/messages`, {}, token);
+    if (seq === loadSeqRef.current) setMessages(msgs.messages.map(toMessage));
+  } catch (e: any) {
+    console.warn('Failed to open conversation:', e.message);
   }
+}
 
   function promptNewChat() {
     setDrawerOpen(false);
@@ -465,9 +464,9 @@ async function pickFile() {
     ]);
   }
 
-  function sendMessage() {
-    const text = input.trim();
-    const img = pendingImage;
+  function sendMessage(overrides?: { text?: string; image?: PendingImage | null }) {
+    const text = (overrides?.text ?? input).trim();
+    const img = overrides?.image !== undefined ? overrides.image : pendingImage;
     const search = webSearch;
     if ((!text && !img) || sending) return;
     if (!token || !conversationId) {
@@ -606,7 +605,7 @@ async function pickFile() {
 
   const lastId = messages[messages.length - 1]?.id;
 
-const renderItem = useCallback(
+  const renderItem = useCallback(
   ({ item }: { item: Message }) => (
     <MessageBubble
       id={item.id}
@@ -615,13 +614,12 @@ const renderItem = useCallback(
       imageUri={item.imageUri}
       hasImage={item.hasImage}
       token={token}
-      canSpeak={!(sending && item.id === lastId)}
+      canSpeak={item.role === 'assistant'}
       speaking={speakingId === item.id}
       onSpeak={toggleSpeak}
-      fileName={item.fileName}
     />
   ),
-  [token, sending, lastId, speakingId, toggleSpeak],
+  [token, speakingId, toggleSpeak],
 );
 
   const waitingForFirstToken = sending && messages[messages.length - 1]?.content === '';
@@ -657,15 +655,20 @@ const renderItem = useCallback(
             data={messages}
             keyExtractor={(item) => item.id}
             contentContainerStyle={styles.messageList}
-            onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
             renderItem={renderItem}
+            onScroll={onScroll}
+            scrollEventThrottle={16}
+            onContentSizeChange={() => {
+              if (atBottomRef.current) {
+                listRef.current?.scrollToEnd({ animated: false });
+              }
+            }}
             ListEmptyComponent={
               <ThemedView style={styles.emptyState}>
                 <ThemedText type="small">Say hello to get started.</ThemedText>
               </ThemedView>
             }
           />
-
           {waitingForFirstToken && (
             <ThemedView style={styles.typingRow}>
               <ActivityIndicator />
@@ -678,14 +681,6 @@ const renderItem = useCallback(
               <Image source={{ uri: pendingImage.uri }} style={styles.previewImage} />
               <Pressable onPress={() => setPendingImage(null)} hitSlop={10}>
                 <ThemedText type="small">✕ Remove photo</ThemedText>
-              </Pressable>
-            </ThemedView>
-          )}
-          {pendingFile && (
-            <ThemedView type="backgroundElement" style={styles.previewRow}>
-              <ThemedText type="small" numberOfLines={1} style={styles.flex}>📄 {pendingFile.name}</ThemedText>
-              <Pressable onPress={() => setPendingFile(null)} hitSlop={10}>
-                <ThemedText type="small">✕</ThemedText>
               </Pressable>
             </ThemedView>
           )}
@@ -704,10 +699,6 @@ const renderItem = useCallback(
               style={[styles.iconButton, recording && styles.iconButtonOn, (sending || transcribing) && { opacity: 0.4 }]}>
               <ThemedText type="small">{transcribing ? '…' : recording ? '⏹' : '🎤'}</ThemedText>
             </Pressable>
-
-            <Pressable onPress={pickFile} disabled={sending} style={styles.iconButton}>
-              <ThemedText type="small">📎</ThemedText>
-            </Pressable>
             <TextInput
               value={input}
               onChangeText={setInput}
@@ -717,13 +708,13 @@ const renderItem = useCallback(
               multiline
             />
             <Pressable
-              onPress={sendMessage}
-              disabled={sending || (!input.trim() && !pendingImage)}
+              onPress={sending ? abortStream : () => sendMessage()}
+              disabled={!sending && !input.trim() && !pendingImage}
               style={[
                 styles.sendButton,
-                (sending || (!input.trim() && !pendingImage)) && { opacity: 0.4 },
+                (!sending && !input.trim() && !pendingImage) && { opacity: 0.4 },
               ]}>
-              <ThemedText type="code">Send</ThemedText>
+              <ThemedText type="code">{sending ? 'Stop' : 'Send'}</ThemedText>
             </Pressable>
           </ThemedView>
         </KeyboardAvoidingView>
