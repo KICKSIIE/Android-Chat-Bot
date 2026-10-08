@@ -1,8 +1,12 @@
+import * as DocumentPicker from 'expo-document-picker';
+import { SaveFormat, manipulateAsync } from 'expo-image-manipulator';
+import * as ImagePicker from 'expo-image-picker';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Image,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -18,15 +22,34 @@ import { ThemedView } from '@/components/themed-view';
 import { Colors, MaxContentWidth, Spacing } from '@/constants/theme';
 import { BACKEND_URL, apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
+import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioRecorder } from 'expo-audio';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Speech from 'expo-speech';
+
+const cleanForSpeech = (s: string) =>
+  s
+    .split(/\n\s*Sources:\n/)[0]
+    .replace(/```[\s\S]*?```/g, ' code block ')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[*_#`>]/g, '')
+    .trim();
 
 const STREAM_TIMEOUT_MS = 5 * 60 * 1000;
 const FLUSH_INTERVAL_MS = 50;
+// Longest side of a photo after downsizing. Bigger photos cost far more GPU memory and context.
+const MAX_IMAGE_SIDE = 896;
+// Must match the server's default for photo-only messages.
 
 type Message = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  imageUri?: string; // local preview, only for photos sent in this session
+  hasImage?: boolean; // photo sent earlier (loaded from the server)
+  fileName?: string;
 };
+
+type PendingImage = { uri: string; base64: string };
 
 type Conversation = {
   id: number;
@@ -34,23 +57,83 @@ type Conversation = {
   updated_at: string;
 };
 
-const toMessage = (m: any): Message => ({ id: String(m.id), role: m.role, content: m.content });
+type PendingFile = { name: string; base64: string };
+
+const toMessage = (m: any): Message => ({
+  id: String(m.id),
+  role: m.role,
+  content: m.content,
+  hasImage: !!m.has_image,
+  fileName: m.file_name || undefined,
+});
 
 // Memoized so that while a reply streams, only the bubble being updated re-renders.
 const MessageBubble = memo(function MessageBubble({
-  role,
-  content,
+  id, role, content, imageUri, hasImage, token, canSpeak, speaking, onSpeak, fileName,
 }: {
+  id: string;
   role: Message['role'];
   content: string;
+  imageUri?: string;
+  hasImage?: boolean;
+  token?: string | null;
+  canSpeak?: boolean;
+  speaking?: boolean;
+  onSpeak?: (id: string, text: string) => void;
+  fileName?: string;   // add this
 }) {
+  const remoteUri = hasImage && /^\d+$/.test(id) ? `${BACKEND_URL}/api/messages/${id}/image` : null;
   return (
     <ThemedView
       type="backgroundElement"
       style={[styles.bubble, role === 'user' ? styles.userBubble : styles.assistantBubble]}>
-      <ThemedText type="small">{content}</ThemedText>
+      {imageUri ? (
+        <Image source={{ uri: imageUri }} style={styles.bubbleImage} />
+      ) : remoteUri && token ? (
+        <RemoteImage uri={remoteUri} token={token} />
+      ) : hasImage ? (
+        <ThemedText type="small">📷 Photo</ThemedText>
+      ) : null}
+      {fileName ? <ThemedText type="small">📄 {fileName}</ThemedText> : null}
+      {content ? <ThemedText type="small">{content}</ThemedText> : null}
+      {role === 'assistant' && canSpeak && content && onSpeak ? (
+      <Pressable onPress={() => onSpeak(id, content)} hitSlop={8} style={styles.speakButton}>
+        <ThemedText type="small">{speaking ? '⏹ Stop' : '🔊 Read aloud'}</ThemedText>
+      </Pressable>
+    ) : null}
     </ThemedView>
   );
+
+  function RemoteImage({ uri, token }: { uri: string; token: string }) {
+    const [src, setSrc] = useState<string | null>(null);
+
+    useEffect(() => {
+      let cancelled = false;
+      (async () => {
+        try {
+          const r = await fetch(uri, {
+            headers: { Authorization: `Bearer ${token}`, 'ngrok-skip-browser-warning': 'true' },
+          });
+          if (!r.ok) throw new Error(`status ${r.status}`);
+          const blob = await r.blob();
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            if (!cancelled && typeof reader.result === 'string') setSrc(reader.result);
+          };
+          reader.readAsDataURL(blob);
+        } catch (e: any) {
+          console.warn('image load failed:', e.message);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [uri, token]);
+
+    if (!src) return <ThemedText type="small">📷 Photo</ThemedText>;
+    return <Image source={{ uri: src }} style={styles.bubbleImage} />;
+  }
+
 });
 
 export default function ChatScreen() {
@@ -62,6 +145,30 @@ export default function ChatScreen() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
+  const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
+const canSend = !!input.trim() || !!pendingImage || !!pendingFile;
+
+async function pickFile() {
+  try {
+    const res = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
+    if (res.canceled || !res.assets?.[0]) return;
+    const a = res.assets[0];
+    if (!/\.(pdf|docx|txt|md|csv|json)$/i.test(a.name)) {
+      Alert.alert('Unsupported file', 'Use PDF, DOCX, TXT, MD, CSV or JSON.');
+      return;
+    }
+    if ((a.size ?? 0) > 5 * 1024 * 1024) {
+      Alert.alert('File too large', 'Choose a file under 5 MB.');
+      return;
+    }
+    const base64 = await FileSystem.readAsStringAsync(a.uri, { encoding: FileSystem.EncodingType.Base64 });
+    setPendingFile({ name: a.name, base64 });
+  } catch (e: any) {
+    Alert.alert('Could not add file', e.message);
+  }
+}
+  const [webSearch, setWebSearch] = useState(false);
   const listRef = useRef<FlatList<Message>>(null);
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -77,6 +184,92 @@ export default function ChatScreen() {
   const xhrRef = useRef<XMLHttpRequest | null>(null);
   const streamIdRef = useRef(0); // bumped to invalidate an in-flight stream
   const loadSeqRef = useRef(0); // guards against out-of-order message loads
+
+  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+
+  async function toggleRecording() {
+    if (transcribing || sending || !token) return;
+    try {
+      if (!recording) {
+        const perm = await AudioModule.requestRecordingPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert('Permission needed', 'Allow microphone access to use voice input.');
+          return;
+        }
+        stopSpeaking();
+        await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+        await recorder.prepareToRecordAsync();
+        recorder.record();
+        setRecording(true);
+        return;
+      }
+
+      setRecording(false);
+      setTranscribing(true);
+      await recorder.stop();
+      await setAudioModeAsync({ allowsRecording: false }); // lets read-aloud use the speaker again
+      const uri = recorder.uri;
+      if (!uri) throw new Error('No recording was saved.');
+
+      const info = await FileSystem.getInfoAsync(uri);
+      console.log('recording file size:', info.exists ? (info as any).size : 'missing');
+      const audio = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      console.log('base64 length:', audio.length);
+      const r = await fetch(`${BACKEND_URL}/api/transcribe`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true',
+        },
+        body: JSON.stringify({ audio }),
+      });
+      if (r.status === 401) {
+        signOut();
+        return;
+      }
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `Request failed (${r.status})`);
+      const text = (data.text || '').trim();
+      if (!text) {
+        Alert.alert('Nothing heard', 'Try again and speak a little closer to the mic.');
+        return;
+      }
+      setInput((prev) => (prev ? `${prev} ${text}` : text));
+    } catch (e: any) {
+      setRecording(false);
+      Alert.alert('Voice input failed', e.message);
+    } finally {
+      setTranscribing(false);
+    }
+  }
+
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+
+  const stopSpeaking = useCallback(() => {
+    Speech.stop();
+    setSpeakingId(null);
+  }, []);
+
+  const toggleSpeak = useCallback(
+  (id: string, text: string) => {
+    if (speakingId === id) {
+      stopSpeaking();
+      return;
+    }
+    Speech.stop();
+    const clean = cleanForSpeech(text).slice(0, Speech.maxSpeechInputLength - 1);
+    if (!clean) return;
+    const done = () => setSpeakingId((cur) => (cur === id ? null : cur));
+    setSpeakingId(id);
+    Speech.speak(clean, { language: 'en-US', onDone: done, onStopped: done, onError: done });
+  },
+  [speakingId, stopSpeaking],
+  );
 
   const abortStream = useCallback(() => {
     streamIdRef.current += 1;
@@ -230,9 +423,53 @@ export default function ChatScreen() {
       .catch(() => {});
   }
 
+  async function pickImage(source: 'camera' | 'library') {
+    try {
+      if (source === 'camera') {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert('Permission needed', 'Allow camera access to take a photo.');
+          return;
+        }
+      }
+      const result =
+        source === 'camera'
+          ? await ImagePicker.launchCameraAsync({ quality: 0.8 })
+          : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.8 });
+      if (result.canceled || !result.assets?.[0]) return;
+
+      const asset = result.assets[0];
+      // Shrink before upload: phone photos are huge, and the model only needs about 900px.
+      const longest = Math.max(asset.width, asset.height);
+      const actions =
+        longest > MAX_IMAGE_SIDE
+          ? [{ resize: asset.width >= asset.height ? { width: MAX_IMAGE_SIDE } : { height: MAX_IMAGE_SIDE } }]
+          : [];
+      const out = await manipulateAsync(asset.uri, actions, {
+        compress: 0.7,
+        format: SaveFormat.JPEG,
+        base64: true,
+      });
+      if (!out.base64) throw new Error('Could not read the photo.');
+      setPendingImage({ uri: out.uri, base64: out.base64 });
+    } catch (e: any) {
+      Alert.alert('Could not add photo', e.message);
+    }
+  }
+
+  function showPhotoMenu() {
+    Alert.alert('Add a photo', undefined, [
+      { text: 'Take photo', onPress: () => pickImage('camera') },
+      { text: 'Choose from library', onPress: () => pickImage('library') },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }
+
   function sendMessage() {
     const text = input.trim();
-    if (!text || sending) return;
+    const img = pendingImage;
+    const search = webSearch;
+    if ((!text && !img) || sending) return;
     if (!token || !conversationId) {
       Alert.alert('Not ready', 'No conversation is open yet.');
       return;
@@ -242,10 +479,16 @@ export default function ChatScreen() {
     const assistantId = `${stamp}-a`;
     setMessages((prev) => [
       ...prev,
-      { id: `${stamp}-u`, role: 'user', content: text },
+      {
+        id: `${stamp}-u`,
+        role: 'user',
+        content: text,
+        imageUri: img?.uri,
+      },
       { id: assistantId, role: 'assistant', content: '' },
     ]);
     setInput('');
+    setPendingImage(null);
     setSending(true);
 
     const myStream = ++streamIdRef.current;
@@ -351,13 +594,35 @@ export default function ChatScreen() {
       refreshConversationList();
     };
 
-    xhr.send(JSON.stringify({ conversationId, message: text }));
+    xhr.send(
+      JSON.stringify({
+        conversationId,
+        message: text,
+        image: img?.base64,
+        webSearch: search,
+      }),
+    );
   }
 
-  const renderItem = useCallback(
-    ({ item }: { item: Message }) => <MessageBubble role={item.role} content={item.content} />,
-    [],
-  );
+  const lastId = messages[messages.length - 1]?.id;
+
+const renderItem = useCallback(
+  ({ item }: { item: Message }) => (
+    <MessageBubble
+      id={item.id}
+      role={item.role}
+      content={item.content}
+      imageUri={item.imageUri}
+      hasImage={item.hasImage}
+      token={token}
+      canSpeak={!(sending && item.id === lastId)}
+      speaking={speakingId === item.id}
+      onSpeak={toggleSpeak}
+      fileName={item.fileName}
+    />
+  ),
+  [token, sending, lastId, speakingId, toggleSpeak],
+);
 
   const waitingForFirstToken = sending && messages[messages.length - 1]?.content === '';
 
@@ -408,19 +673,56 @@ export default function ChatScreen() {
             </ThemedView>
           )}
 
+          {pendingImage && (
+            <ThemedView type="backgroundElement" style={styles.previewRow}>
+              <Image source={{ uri: pendingImage.uri }} style={styles.previewImage} />
+              <Pressable onPress={() => setPendingImage(null)} hitSlop={10}>
+                <ThemedText type="small">✕ Remove photo</ThemedText>
+              </Pressable>
+            </ThemedView>
+          )}
+          {pendingFile && (
+            <ThemedView type="backgroundElement" style={styles.previewRow}>
+              <ThemedText type="small" numberOfLines={1} style={styles.flex}>📄 {pendingFile.name}</ThemedText>
+              <Pressable onPress={() => setPendingFile(null)} hitSlop={10}>
+                <ThemedText type="small">✕</ThemedText>
+              </Pressable>
+            </ThemedView>
+          )}
           <ThemedView type="backgroundElement" style={styles.inputRow}>
+            <Pressable onPress={showPhotoMenu} disabled={sending} style={styles.iconButton}>
+              <ThemedText type="small">📷</ThemedText>
+            </Pressable>
+            <Pressable
+              onPress={() => setWebSearch((v) => !v)}
+              style={[styles.iconButton, webSearch && styles.iconButtonOn]}>
+              <ThemedText type="small">🌐</ThemedText>
+            </Pressable>
+            <Pressable
+              onPress={toggleRecording}
+              disabled={sending || transcribing}
+              style={[styles.iconButton, recording && styles.iconButtonOn, (sending || transcribing) && { opacity: 0.4 }]}>
+              <ThemedText type="small">{transcribing ? '…' : recording ? '⏹' : '🎤'}</ThemedText>
+            </Pressable>
+
+            <Pressable onPress={pickFile} disabled={sending} style={styles.iconButton}>
+              <ThemedText type="small">📎</ThemedText>
+            </Pressable>
             <TextInput
               value={input}
               onChangeText={setInput}
-              placeholder="Message Qwen"
+              placeholder={webSearch ? 'Message Qwen (web search on)' : 'Message Qwen'}
               placeholderTextColor="#888"
               style={[styles.input, { color: colors.text }]}
               multiline
             />
             <Pressable
               onPress={sendMessage}
-              disabled={sending || !input.trim()}
-              style={[styles.sendButton, (sending || !input.trim()) && { opacity: 0.4 }]}>
+              disabled={sending || (!input.trim() && !pendingImage)}
+              style={[
+                styles.sendButton,
+                (sending || (!input.trim() && !pendingImage)) && { opacity: 0.4 },
+              ]}>
               <ThemedText type="code">Send</ThemedText>
             </Pressable>
           </ThemedView>
@@ -513,6 +815,7 @@ export default function ChatScreen() {
 }
 
 const styles = StyleSheet.create({
+  speakButton: { marginTop: 6, alignSelf: 'flex-start' },
   container: { flex: 1 },
   flex: { flex: 1 },
   safeArea: {
@@ -554,6 +857,17 @@ const styles = StyleSheet.create({
   },
   userBubble: { alignSelf: 'flex-end' },
   assistantBubble: { alignSelf: 'flex-start' },
+  bubbleImage: { width: 200, height: 200, borderRadius: 8, marginBottom: 6 },
+  previewRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.three,
+    paddingHorizontal: Spacing.three,
+    paddingTop: Spacing.two,
+  },
+  previewImage: { width: 56, height: 56, borderRadius: 8 },
+  iconButton: { paddingHorizontal: 8, paddingVertical: 8, borderRadius: 8 },
+  iconButtonOn: { backgroundColor: '#8883' },
   typingRow: {
     flexDirection: 'row',
     alignItems: 'center',
