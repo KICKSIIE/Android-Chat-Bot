@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -9,14 +9,18 @@ import {
   Pressable,
   StyleSheet,
   TextInput,
+  useColorScheme,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { MaxContentWidth, Spacing } from '@/constants/theme';
+import { Colors, MaxContentWidth, Spacing } from '@/constants/theme';
 import { BACKEND_URL, apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
+
+const STREAM_TIMEOUT_MS = 5 * 60 * 1000;
+const FLUSH_INTERVAL_MS = 50;
 
 type Message = {
   id: string;
@@ -30,8 +34,30 @@ type Conversation = {
   updated_at: string;
 };
 
+const toMessage = (m: any): Message => ({ id: String(m.id), role: m.role, content: m.content });
+
+// Memoized so that while a reply streams, only the bubble being updated re-renders.
+const MessageBubble = memo(function MessageBubble({
+  role,
+  content,
+}: {
+  role: Message['role'];
+  content: string;
+}) {
+  return (
+    <ThemedView
+      type="backgroundElement"
+      style={[styles.bubble, role === 'user' ? styles.userBubble : styles.assistantBubble]}>
+      <ThemedText type="small">{content}</ThemedText>
+    </ThemedView>
+  );
+});
+
 export default function ChatScreen() {
   const { token, signOut } = useAuth();
+  const scheme = useColorScheme();
+  const colors = Colors[scheme === 'dark' ? 'dark' : 'light'];
+
   const [conversationId, setConversationId] = useState<number | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -39,11 +65,36 @@ export default function ChatScreen() {
   const listRef = useRef<FlatList<Message>>(null);
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const conversationsRef = useRef<Conversation[]>([]);
+  conversationsRef.current = conversations;
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   const [nameModalVisible, setNameModalVisible] = useState(false);
   const [nameInput, setNameInput] = useState('');
   const [nameTargetId, setNameTargetId] = useState<number | null>(null);
+
+  // Streaming bookkeeping
+  const xhrRef = useRef<XMLHttpRequest | null>(null);
+  const streamIdRef = useRef(0); // bumped to invalidate an in-flight stream
+  const loadSeqRef = useRef(0); // guards against out-of-order message loads
+
+  const abortStream = useCallback(() => {
+    streamIdRef.current += 1;
+    if (xhrRef.current) {
+      xhrRef.current.abort();
+      xhrRef.current = null;
+    }
+    setSending(false);
+  }, []);
+
+  // Cancel any running stream when the screen unmounts.
+  useEffect(
+    () => () => {
+      streamIdRef.current += 1;
+      xhrRef.current?.abort();
+    },
+    [],
+  );
 
   useEffect(() => {
     (async () => {
@@ -64,14 +115,9 @@ export default function ChatScreen() {
         const id = list.conversations[0].id;
         setConversationId(id);
 
+        const seq = ++loadSeqRef.current;
         const msgs = await apiFetch(`/api/conversations/${id}/messages`, {}, token);
-        setMessages(
-          msgs.messages.map((m: any) => ({
-            id: String(m.id),
-            role: m.role,
-            content: m.content,
-          })),
-        );
+        if (seq === loadSeqRef.current) setMessages(msgs.messages.map(toMessage));
       } catch (e: any) {
         console.warn('Failed to load conversation:', e.message);
       }
@@ -81,17 +127,14 @@ export default function ChatScreen() {
   async function openConversation(id: number) {
     if (!token) return;
     setDrawerOpen(false);
+    if (id === conversationId) return;
+    abortStream();
+    const seq = ++loadSeqRef.current;
     try {
       setConversationId(id);
       setMessages([]);
       const msgs = await apiFetch(`/api/conversations/${id}/messages`, {}, token);
-      setMessages(
-        msgs.messages.map((m: any) => ({
-          id: String(m.id),
-          role: m.role,
-          content: m.content,
-        })),
-      );
+      if (seq === loadSeqRef.current) setMessages(msgs.messages.map(toMessage));
     } catch (e: any) {
       console.warn('Failed to open conversation:', e.message);
     }
@@ -122,6 +165,8 @@ export default function ChatScreen() {
           { method: 'POST', body: JSON.stringify({ title }) },
           token,
         );
+        abortStream();
+        loadSeqRef.current += 1;
         setConversations((prev) => [created.conversation, ...prev]);
         setConversationId(created.conversation.id);
         setMessages([]);
@@ -132,13 +177,11 @@ export default function ChatScreen() {
           token,
         );
         setConversations((prev) =>
-          prev.map((c) =>
-            c.id === nameTargetId ? { ...c, title: updated.conversation.title } : c,
-          ),
+          prev.map((c) => (c.id === nameTargetId ? { ...c, title: updated.conversation.title } : c)),
         );
       }
     } catch (e: any) {
-      console.warn('Failed to save conversation name:', e.message);
+      Alert.alert('Could not save', e.message);
     } finally {
       setNameModalVisible(false);
       setNameTargetId(null);
@@ -152,11 +195,7 @@ export default function ChatScreen() {
       `"${title}" and all its messages will be permanently deleted.`,
       [
         { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: () => deleteConversation(id),
-        },
+        { text: 'Delete', style: 'destructive', onPress: () => deleteConversation(id) },
       ],
     );
   }
@@ -164,8 +203,11 @@ export default function ChatScreen() {
   async function deleteConversation(id: number) {
     if (!token) return;
     try {
+      if (id === conversationId) abortStream();
       await apiFetch(`/api/conversations/${id}`, { method: 'DELETE' }, token);
-      const remaining = conversations.filter((c) => c.id !== id);
+
+      // Read the latest list from the ref, not from this closure, which may be stale after the await.
+      const remaining = conversationsRef.current.filter((c) => c.id !== id);
       setConversations(remaining);
 
       if (id === conversationId) {
@@ -177,7 +219,7 @@ export default function ChatScreen() {
         }
       }
     } catch (e: any) {
-      console.warn('Failed to delete conversation:', e.message);
+      Alert.alert('Could not delete', e.message);
     }
   }
 
@@ -188,99 +230,136 @@ export default function ChatScreen() {
       .catch(() => {});
   }
 
-  async function sendMessage() {
+  function sendMessage() {
     const text = input.trim();
     if (!text || sending) return;
     if (!token || !conversationId) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-e`,
-          role: 'assistant',
-          content: 'Not ready — no conversation yet.',
-        },
-      ]);
+      Alert.alert('Not ready', 'No conversation is open yet.');
       return;
     }
 
-    const userMessage: Message = { id: `${Date.now()}-u`, role: 'user', content: text };
-    const assistantId = `${Date.now()}-a`;
+    const stamp = Date.now();
+    const assistantId = `${stamp}-a`;
     setMessages((prev) => [
       ...prev,
-      userMessage,
+      { id: `${stamp}-u`, role: 'user', content: text },
       { id: assistantId, role: 'assistant', content: '' },
     ]);
     setInput('');
     setSending(true);
 
-    await new Promise<void>((resolve) => {
-      const xhr = new XMLHttpRequest();
-      let lastLength = 0;
+    const myStream = ++streamIdRef.current;
+    const isStale = () => myStream !== streamIdRef.current;
 
-      xhr.open('POST', `${BACKEND_URL}/api/chat`);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-      xhr.setRequestHeader('ngrok-skip-browser-warning', 'true');
+    // Tokens are collected and applied at most every FLUSH_INTERVAL_MS to avoid re-rendering per token.
+    let pending = '';
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-      xhr.onprogress = () => {
-        const newText = xhr.responseText.slice(lastLength);
-        lastLength = xhr.responseText.length;
+    const flush = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (!pending || isStale()) {
+        pending = '';
+        return;
+      }
+      const add = pending;
+      pending = '';
+      setMessages((prev) => {
+        const i = prev.length - 1;
+        if (i < 0 || prev[i].id !== assistantId) return prev;
+        const copy = prev.slice();
+        copy[i] = { ...prev[i], content: prev[i].content + add };
+        return copy;
+      });
+    };
 
-        const chunks = newText.split('\n\n').filter((c) => c.startsWith('data: '));
-        for (const chunk of chunks) {
-          try {
-            const parsed = JSON.parse(chunk.replace('data: ', ''));
-            if (parsed.error) {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId ? { ...m, content: `Error: ${parsed.error}` } : m,
-                ),
-              );
-              continue;
-            }
-            if (parsed.content) {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId ? { ...m, content: m.content + parsed.content } : m,
-                ),
-              );
-            }
-          } catch {
-            // partial chunk; ignore
-          }
+    const queueText = (s: string) => {
+      pending += s;
+      if (!timer) timer = setTimeout(flush, FLUSH_INTERVAL_MS);
+    };
+
+    const showError = (msg: string) => {
+      flush();
+      if (isStale()) return;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId ? { ...m, content: m.content ? `${m.content}\n\n[${msg}]` : msg } : m,
+        ),
+      );
+    };
+
+    const xhr = new XMLHttpRequest();
+    xhrRef.current = xhr;
+    let lastLength = 0;
+    let sseBuf = '';
+
+    // SSE events end with a blank line, but one event can arrive split across two progress
+    // callbacks, so keep any unfinished tail in sseBuf until the rest arrives.
+    const processProgress = () => {
+      if (xhr.status !== 200) return;
+      sseBuf += xhr.responseText.slice(lastLength);
+      lastLength = xhr.responseText.length;
+
+      let idx: number;
+      while ((idx = sseBuf.indexOf('\n\n')) >= 0) {
+        const evt = sseBuf.slice(0, idx);
+        sseBuf = sseBuf.slice(idx + 2);
+        if (!evt.startsWith('data: ')) continue;
+        try {
+          const parsed = JSON.parse(evt.slice(6));
+          if (parsed.error) showError(parsed.error);
+          else if (parsed.content) queueText(parsed.content);
+        } catch {
+          // malformed event; skip it
         }
-        requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
-      };
+      }
+    };
 
-      xhr.onerror = () => {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantId
-              ? { ...m, content: "Couldn't reach the server (network error)" }
-              : m,
-          ),
-        );
-        resolve();
-      };
+    xhr.open('POST', `${BACKEND_URL}/api/chat`);
+    xhr.timeout = STREAM_TIMEOUT_MS;
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.setRequestHeader('ngrok-skip-browser-warning', 'true');
 
-      xhr.onloadend = () => {
-        if (xhr.status !== 200 && xhr.status !== 0) {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId
-                ? { ...m, content: `Couldn't reach the server (status ${xhr.status})` }
-                : m,
-            ),
-          );
-        }
-        setSending(false);
-        refreshConversationList();
-        resolve();
-      };
+    xhr.onprogress = () => {
+      if (isStale()) return;
+      processProgress();
+    };
 
-      xhr.send(JSON.stringify({ conversationId, message: text }));
-    });
+    xhr.onerror = () => showError("Couldn't reach the server (network error)");
+    xhr.ontimeout = () => showError('The request timed out');
+
+    xhr.onloadend = () => {
+      if (isStale()) return; // cancelled or replaced: leave state alone
+      processProgress();
+      flush();
+
+      if (xhr.status === 401) {
+        signOut();
+      } else if (xhr.status >= 400) {
+        let msg = `Request failed (status ${xhr.status})`;
+        try {
+          msg = JSON.parse(xhr.responseText).error || msg;
+        } catch {}
+        showError(msg);
+      }
+
+      xhrRef.current = null;
+      setSending(false);
+      refreshConversationList();
+    };
+
+    xhr.send(JSON.stringify({ conversationId, message: text }));
   }
+
+  const renderItem = useCallback(
+    ({ item }: { item: Message }) => <MessageBubble role={item.role} content={item.content} />,
+    [],
+  );
+
+  const waitingForFirstToken = sending && messages[messages.length - 1]?.content === '';
 
   return (
     <ThemedView style={styles.container}>
@@ -290,11 +369,16 @@ export default function ChatScreen() {
             <ThemedText type="small">☰</ThemedText>
           </Pressable>
 
-          <ThemedText type="small">
+          <ThemedText type="small" numberOfLines={1} style={styles.headerTitle}>
             {conversations.find((c) => c.id === conversationId)?.title || 'Chat'}
           </ThemedText>
 
-          <Pressable onPress={signOut} style={styles.headerButton}>
+          <Pressable
+            onPress={() => {
+              abortStream();
+              signOut();
+            }}
+            style={styles.headerButton}>
             <ThemedText type="small">Sign out</ThemedText>
           </Pressable>
         </ThemedView>
@@ -309,16 +393,7 @@ export default function ChatScreen() {
             keyExtractor={(item) => item.id}
             contentContainerStyle={styles.messageList}
             onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
-            renderItem={({ item }) => (
-              <ThemedView
-                type="backgroundElement"
-                style={[
-                  styles.bubble,
-                  item.role === 'user' ? styles.userBubble : styles.assistantBubble,
-                ]}>
-                <ThemedText type="small">{item.content}</ThemedText>
-              </ThemedView>
-            )}
+            renderItem={renderItem}
             ListEmptyComponent={
               <ThemedView style={styles.emptyState}>
                 <ThemedText type="small">Say hello to get started.</ThemedText>
@@ -326,7 +401,7 @@ export default function ChatScreen() {
             }
           />
 
-          {sending && (
+          {waitingForFirstToken && (
             <ThemedView style={styles.typingRow}>
               <ActivityIndicator />
               <ThemedText type="small">Thinking…</ThemedText>
@@ -338,21 +413,21 @@ export default function ChatScreen() {
               value={input}
               onChangeText={setInput}
               placeholder="Message Qwen"
-              style={styles.input}
+              placeholderTextColor="#888"
+              style={[styles.input, { color: colors.text }]}
               multiline
-              onSubmitEditing={sendMessage}
             />
             <Pressable
               onPress={sendMessage}
               disabled={sending || !input.trim()}
-              style={styles.sendButton}>
+              style={[styles.sendButton, (sending || !input.trim()) && { opacity: 0.4 }]}>
               <ThemedText type="code">Send</ThemedText>
             </Pressable>
           </ThemedView>
         </KeyboardAvoidingView>
       </SafeAreaView>
 
-      {/* Drawer modal — must be a sibling of SafeAreaView so it overlays the whole screen */}
+      {/* Drawer modal: must be a sibling of SafeAreaView so it overlays the whole screen */}
       <Modal
         visible={drawerOpen}
         transparent
@@ -368,37 +443,31 @@ export default function ChatScreen() {
             data={conversations}
             keyExtractor={(c) => String(c.id)}
             renderItem={({ item }) => (
-            <ThemedView
-              style={[
-                styles.drawerRow,
-                item.id === conversationId && styles.drawerItemActive,
-              ]}>
-              <Pressable
-                onPress={() => openConversation(item.id)}
-                style={styles.drawerRowMain}>
-                <ThemedText type="small" numberOfLines={1}>
-                  {item.title}
-                </ThemedText>
-              </Pressable>
+              <ThemedView style={[styles.drawerRow, item.id === conversationId && styles.drawerItemActive]}>
+                <Pressable onPress={() => openConversation(item.id)} style={styles.drawerRowMain}>
+                  <ThemedText type="small" numberOfLines={1}>
+                    {item.title}
+                  </ThemedText>
+                </Pressable>
 
-              <Pressable
-                onPress={() =>
-                  Alert.alert(item.title, undefined, [
-                    { text: 'Rename', onPress: () => promptRename(item.id, item.title) },
-                    {
-                      text: 'Delete',
-                      style: 'destructive',
-                      onPress: () => confirmDelete(item.id, item.title),
-                    },
-                    { text: 'Cancel', style: 'cancel' },
-                  ])
-                }
-                hitSlop={10}
-                style={styles.drawerRowMenu}>
-                <ThemedText type="small">☰</ThemedText>
-              </Pressable>
-            </ThemedView>
-          )}
+                <Pressable
+                  onPress={() =>
+                    Alert.alert(item.title, undefined, [
+                      { text: 'Rename', onPress: () => promptRename(item.id, item.title) },
+                      {
+                        text: 'Delete',
+                        style: 'destructive',
+                        onPress: () => confirmDelete(item.id, item.title),
+                      },
+                      { text: 'Cancel', style: 'cancel' },
+                    ])
+                  }
+                  hitSlop={10}
+                  style={styles.drawerRowMenu}>
+                  <ThemedText type="small">⋯</ThemedText>
+                </Pressable>
+              </ThemedView>
+            )}
             ListEmptyComponent={
               <ThemedView style={styles.drawerEmpty}>
                 <ThemedText type="small">No conversations yet.</ThemedText>
@@ -408,14 +477,14 @@ export default function ChatScreen() {
         </ThemedView>
       </Modal>
 
-      {/* Name modal — used for creating and renaming */}
+      {/* Name modal: used for creating and renaming */}
       <Modal
         visible={nameModalVisible}
         transparent
         animationType="fade"
         onRequestClose={() => setNameModalVisible(false)}>
         <Pressable style={styles.backdrop} onPress={() => setNameModalVisible(false)} />
-        <ThemedView style={styles.nameModal}>
+        <ThemedView type="backgroundElement" style={styles.nameModal}>
           <ThemedText type="small" style={styles.nameModalTitle}>
             {nameTargetId === null ? 'Name your new chat' : 'Rename chat'}
           </ThemedText>
@@ -423,23 +492,18 @@ export default function ChatScreen() {
             value={nameInput}
             onChangeText={setNameInput}
             placeholder="Chat name"
-            style={styles.nameInput}
+            placeholderTextColor="#888"
+            style={[styles.nameInput, { color: colors.text }]}
             autoFocus
+            maxLength={100}
             onSubmitEditing={submitName}
           />
-          <ThemedView style={styles.nameActions}>
-            <Pressable
-              onPress={() => setNameModalVisible(false)}
-              style={styles.nameButton}>
+          <ThemedView type="backgroundElement" style={styles.nameActions}>
+            <Pressable onPress={() => setNameModalVisible(false)} style={styles.nameButton}>
               <ThemedText type="small">Cancel</ThemedText>
             </Pressable>
-            <Pressable
-              onPress={submitName}
-              disabled={!nameInput.trim()}
-              style={styles.nameButton}>
-              <ThemedText type="small">
-                {nameTargetId === null ? 'Create' : 'Save'}
-              </ThemedText>
+            <Pressable onPress={submitName} disabled={!nameInput.trim()} style={styles.nameButton}>
+              <ThemedText type="small">{nameTargetId === null ? 'Create' : 'Save'}</ThemedText>
             </Pressable>
           </ThemedView>
         </ThemedView>
@@ -449,23 +513,6 @@ export default function ChatScreen() {
 }
 
 const styles = StyleSheet.create({
-  drawerRow: {
-  flexDirection: 'row',
-  alignItems: 'center',
-  borderBottomWidth: StyleSheet.hairlineWidth,
-  borderBottomColor: '#3333',
-},
-drawerRowMain: {
-  flex: 1,
-  paddingVertical: Spacing.three,
-  paddingRight: Spacing.two,
-},
-drawerRowMenu: {
-  paddingHorizontal: Spacing.two,
-  paddingVertical: Spacing.three,
-  minWidth: 40,
-  alignItems: 'center',
-},
   container: { flex: 1 },
   flex: { flex: 1 },
   safeArea: {
@@ -486,6 +533,7 @@ drawerRowMenu: {
     paddingHorizontal: Spacing.two,
     minWidth: 60,
   },
+  headerTitle: { flex: 1, textAlign: 'center' },
   messageList: {
     paddingHorizontal: Spacing.three,
     paddingTop: Spacing.three,
@@ -552,10 +600,22 @@ drawerRowMenu: {
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#3333',
   },
-  drawerItem: {
-    paddingVertical: Spacing.three,
+  drawerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#3333',
+  },
+  drawerRowMain: {
+    flex: 1,
+    paddingVertical: Spacing.three,
+    paddingRight: Spacing.two,
+  },
+  drawerRowMenu: {
+    paddingHorizontal: Spacing.two,
+    paddingVertical: Spacing.three,
+    minWidth: 40,
+    alignItems: 'center',
   },
   drawerItemActive: {
     backgroundColor: '#8881',
@@ -571,7 +631,6 @@ drawerRowMenu: {
     right: 24,
     padding: Spacing.four,
     borderRadius: Spacing.three,
-    backgroundColor: '#fff',
   },
   nameModalTitle: {
     marginBottom: Spacing.three,
@@ -579,7 +638,7 @@ drawerRowMenu: {
   },
   nameInput: {
     borderWidth: 1,
-    borderColor: '#ccc',
+    borderColor: '#8885',
     borderRadius: 8,
     paddingHorizontal: Spacing.three,
     paddingVertical: Spacing.two,

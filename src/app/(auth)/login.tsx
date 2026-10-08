@@ -1,3 +1,4 @@
+import { ApiError } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
 import { Link, useRouter } from 'expo-router';
 import { useState } from 'react';
@@ -6,21 +7,27 @@ import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, TextInput, View 
 export default function LoginScreen() {
   const { signIn } = useAuth();
   const router = useRouter();
-  const [usernameOrEmail, setUsernameOrEmail] = useState('');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
 
   async function onSubmit() {
-    if (!usernameOrEmail || !password) {
-      Alert.alert('Missing fields', 'Enter your username/email and password.');
+    const cleanEmail = email.trim();
+    if (!cleanEmail || !password) {
+      Alert.alert('Missing fields', 'Enter your email and password.');
       return;
     }
     setBusy(true);
     try {
-      await signIn(usernameOrEmail, password);
+      await signIn(cleanEmail, password);
       router.replace('/(tabs)/chat');
     } catch (e: any) {
-      Alert.alert('Login failed', e.message);
+      if (e instanceof ApiError && e.data?.code === 'EMAIL_NOT_VERIFIED') {
+        // Correct password, but the email was never confirmed. A fresh code was just sent.
+        router.push({ pathname: '/(auth)/verify', params: { email: e.data.email ?? cleanEmail } });
+      } else {
+        Alert.alert('Login failed', e.message);
+      }
     } finally {
       setBusy(false);
     }
@@ -31,17 +38,21 @@ export default function LoginScreen() {
       <Text style={styles.title}>Sign in</Text>
 
       <TextInput
-        placeholder="Username or email"
+        placeholder="Email"
         autoCapitalize="none"
-        value={usernameOrEmail}
-        onChangeText={setUsernameOrEmail}
+        autoComplete="email"
+        keyboardType="email-address"
+        value={email}
+        onChangeText={setEmail}
         style={styles.input}
       />
       <TextInput
         placeholder="Password"
         secureTextEntry
+        autoComplete="current-password"
         value={password}
         onChangeText={setPassword}
+        onSubmitEditing={onSubmit}
         style={styles.input}
       />
 

@@ -3,6 +3,8 @@ import { Link, useRouter } from 'expo-router';
 import { useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export default function SignupScreen() {
   const { signUp } = useAuth();
   const router = useRouter();
@@ -12,8 +14,18 @@ export default function SignupScreen() {
   const [busy, setBusy] = useState(false);
 
   async function onSubmit() {
-    if (!username || !email || !password) {
+    const name = username.trim();
+    const cleanEmail = email.trim().toLowerCase();
+    if (!name || !cleanEmail || !password) {
       Alert.alert('Missing fields', 'Fill in all fields.');
+      return;
+    }
+    if (name.length < 2 || name.length > 30) {
+      Alert.alert('Username', 'Use 2 to 30 characters.');
+      return;
+    }
+    if (!EMAIL_RE.test(cleanEmail)) {
+      Alert.alert('Email', 'Enter a valid email address.');
       return;
     }
     if (password.length < 8) {
@@ -22,8 +34,8 @@ export default function SignupScreen() {
     }
     setBusy(true);
     try {
-      await signUp(username, email, password);
-      router.replace('/(tabs)/chat');
+      await signUp(name, cleanEmail, password);
+      router.push({ pathname: '/(auth)/verify', params: { email: cleanEmail } });
     } catch (e: any) {
       Alert.alert('Signup failed', e.message);
     } finally {
@@ -36,8 +48,23 @@ export default function SignupScreen() {
       <Text style={styles.title}>Create account</Text>
 
       <TextInput placeholder="Username" autoCapitalize="none" value={username} onChangeText={setUsername} style={styles.input} />
-      <TextInput placeholder="Email" autoCapitalize="none" keyboardType="email-address" value={email} onChangeText={setEmail} style={styles.input} />
-      <TextInput placeholder="Password (min 8 chars)" secureTextEntry value={password} onChangeText={setPassword} style={styles.input} />
+      <TextInput
+        placeholder="Email"
+        autoCapitalize="none"
+        autoComplete="email"
+        keyboardType="email-address"
+        value={email}
+        onChangeText={setEmail}
+        style={styles.input}
+      />
+      <TextInput
+        placeholder="Password (min 8 chars)"
+        secureTextEntry
+        autoComplete="new-password"
+        value={password}
+        onChangeText={setPassword}
+        style={styles.input}
+      />
 
       <Pressable onPress={onSubmit} disabled={busy} style={styles.button}>
         {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Sign up</Text>}
