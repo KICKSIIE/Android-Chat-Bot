@@ -1,6 +1,6 @@
 import { SaveFormat, manipulateAsync } from 'expo-image-manipulator';
 import * as ImagePicker from 'expo-image-picker';
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -27,6 +27,8 @@ import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioRecorder } fr
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Speech from 'expo-speech';
 
+// Turns a chat reply into text that sounds natural when read aloud:
+// drops the "Sources:" footer, replaces code blocks, keeps link text only, strips markdown symbols.
 const cleanForSpeech = (s: string) =>
   s
     .split(/\n\s*Sources:\n/)[0]
@@ -35,11 +37,15 @@ const cleanForSpeech = (s: string) =>
     .replace(/[*_#`>]/g, '')
     .trim();
 
-const STREAM_TIMEOUT_MS = 5 * 60 * 1000;
-const FLUSH_INTERVAL_MS = 50;
+const STREAM_TIMEOUT_MS = 5 * 60 * 1000; // give up on a reply after 5 minutes
+const FLUSH_INTERVAL_MS = 50; // how often streamed text is pushed into React state
 // Longest side of a photo after downsizing. Bigger photos cost far more GPU memory and context.
 const MAX_IMAGE_SIDE = 896;
-// Must match the server's default for photo-only messages.
+// Extra space for the iOS header when the keyboard is open. Adjust if your header height changes.
+// Android relies on the system's own "resize" behavior, so it gets no offset (test with the keyboard open).
+const KEYBOARD_OFFSET_IOS = 80;
+// Within this many pixels of the bottom counts as "at the bottom" for auto-scroll.
+const AT_BOTTOM_THRESHOLD = 80;
 
 type Message = {
   id: string;
@@ -49,16 +55,6 @@ type Message = {
   hasImage?: boolean; // photo sent earlier (loaded from the server)
 };
 
-
-const atBottomRef = useRef(true);
-
-const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
-  const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
-  const distanceFromBottom =
-    contentSize.height - (contentOffset.y + layoutMeasurement.height);
-  atBottomRef.current = distanceFromBottom < 80; // within ~80px of the bottom
-}, []);
-
 type PendingImage = { uri: string; base64: string };
 
 type Conversation = {
@@ -67,11 +63,29 @@ type Conversation = {
   updated_at: string;
 };
 
+// Converts a message row from the server into the shape the UI uses.
 const toMessage = (m: any): Message => ({
   id: String(m.id),
   role: m.role,
   content: m.content,
   hasImage: !!m.has_image,
+});
+
+// Loads a stored photo from the server. The Image component sends the auth header itself,
+// so the native layer handles downloading, decoding and caching (no manual base64 needed).
+// Defined before MessageBubble, and outside it, so it isn't re-created on every render.
+const RemoteImage = memo(function RemoteImage({ uri, token }: { uri: string; token: string }) {
+  const [failed, setFailed] = useState(false);
+  const source = useMemo(
+    () => ({
+      uri,
+      headers: { Authorization: `Bearer ${token}`, 'ngrok-skip-browser-warning': 'true' },
+    }),
+    [uri, token],
+  );
+
+  if (failed) return <ThemedText type="small">📷 Photo</ThemedText>;
+  return <Image source={source} style={styles.bubbleImage} onError={() => setFailed(true)} />;
 });
 
 // Memoized so that while a reply streams, only the bubble being updated re-renders.
@@ -89,6 +103,7 @@ const MessageBubble = memo(
     speaking?: boolean;
     onSpeak?: (id: string, text: string) => void;
   }) {
+    // Only saved messages have numeric ids; temporary local ids (like "123-u") have no server image yet.
     const remoteUri = hasImage && /^\d+$/.test(id) ? `${BACKEND_URL}/api/messages/${id}/image` : null;
     return (
       <ThemedView
@@ -110,6 +125,7 @@ const MessageBubble = memo(
       </ThemedView>
     );
   },
+  // Custom comparison: re-render only when something the bubble actually shows has changed.
   (prev, next) =>
     prev.id === next.id &&
     prev.role === next.role &&
@@ -118,46 +134,16 @@ const MessageBubble = memo(
     prev.hasImage === next.hasImage &&
     prev.speaking === next.speaking &&
     prev.token === next.token &&
-    prev.canSpeak === next.canSpeak,
+    prev.canSpeak === next.canSpeak &&
+    prev.onSpeak === next.onSpeak,
 );
-
-// Move this OUTSIDE MessageBubble
-const RemoteImage = memo(function RemoteImage({ uri, token }: { uri: string; token: string }) {
-  const [src, setSrc] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await fetch(uri, {
-          headers: { Authorization: `Bearer ${token}`, 'ngrok-skip-browser-warning': 'true' },
-        });
-        if (!r.ok) throw new Error(`status ${r.status}`);
-        const buf = await r.arrayBuffer();
-        // Convert bytes → base64 in JS, no native blob store round-trip.
-        const bytes = new Uint8Array(buf);
-        let binary = '';
-        const chunk = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunk) {
-          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as any);
-        }
-        const b64 = btoa(binary);
-        if (!cancelled) setSrc(`data:image/jpeg;base64,${b64}`);
-      } catch (e: any) {
-        console.warn('image load failed:', e.message);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [uri, token]);
-
-  if (!src) return <ThemedText type="small">📷 Photo</ThemedText>;
-  return <Image source={{ uri: src }} style={styles.bubbleImage} />;
-});
 
 export default function ChatScreen() {
   const { token, signOut } = useAuth();
   const scheme = useColorScheme();
   const colors = Colors[scheme === 'dark' ? 'dark' : 'light'];
 
+  // ---- Conversation + message state ----
   const [conversationId, setConversationId] = useState<number | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -167,25 +153,84 @@ export default function ChatScreen() {
   const [webSearch, setWebSearch] = useState(false);
   const listRef = useRef<FlatList<Message>>(null);
 
+  // Hooks must live inside the component. Tracks whether the user is near the bottom,
+  // so streamed text only auto-scrolls when they haven't scrolled up to read.
+  const atBottomRef = useRef(true);
+  const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
+    const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+    atBottomRef.current = distanceFromBottom < AT_BOTTOM_THRESHOLD;
+  }, []);
+
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const conversationsRef = useRef<Conversation[]>([]);
   conversationsRef.current = conversations;
   const [drawerOpen, setDrawerOpen] = useState(false);
 
+  // Shared modal for "new chat" and "rename" (nameTargetId === null means creating)
   const [nameModalVisible, setNameModalVisible] = useState(false);
   const [nameInput, setNameInput] = useState('');
   const [nameTargetId, setNameTargetId] = useState<number | null>(null);
 
-  // Streaming bookkeeping
+  // ---- Streaming bookkeeping ----
   const xhrRef = useRef<XMLHttpRequest | null>(null);
   const streamIdRef = useRef(0); // bumped to invalidate an in-flight stream
   const loadSeqRef = useRef(0); // guards against out-of-order message loads
 
+  // Async callbacks (like voice input) run long after the render that created them.
+  // These refs always hold the LATEST values so those callbacks never use stale ones.
+  const inputRef = useRef('');
+  inputRef.current = input;
+  const sendMessageRef = useRef(sendMessage);
+  sendMessageRef.current = sendMessage;
+
+  // ---- Read aloud ----
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+  // Mirror of speakingId so toggleSpeak can read it without depending on it. That keeps
+  // toggleSpeak's identity stable, so memoized bubbles don't hold an outdated callback.
+  const speakingIdRef = useRef<string | null>(null);
+
+  const setSpeaking = useCallback((id: string | null) => {
+    speakingIdRef.current = id;
+    setSpeakingId(id);
+  }, []);
+
+  const stopSpeaking = useCallback(() => {
+    Speech.stop();
+    setSpeaking(null);
+  }, [setSpeaking]);
+
+  const toggleSpeak = useCallback(
+    (id: string, text: string) => {
+      if (speakingIdRef.current === id) {
+        stopSpeaking();
+        return;
+      }
+      Speech.stop(); // stop any other message that is currently being read
+      const clean = cleanForSpeech(text).slice(0, Speech.maxSpeechInputLength - 1);
+      if (!clean) return;
+      // Only clear the "speaking" state if this message is still the active one.
+      const done = () => {
+        if (speakingIdRef.current === id) setSpeaking(null);
+      };
+      setSpeaking(id);
+      Speech.speak(clean, { language: 'en-US', onDone: done, onStopped: done, onError: done });
+    },
+    [stopSpeaking, setSpeaking],
+  );
+
+  // ---- Voice input ----
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const [recording, setRecording] = useState(false);
+  const recordingRef = useRef(false); // lets the unmount cleanup know if a recording is running
   const [transcribing, setTranscribing] = useState(false);
-  const lastMessageId = messages[messages.length - 1]?.id;
 
+  const updateRecording = (value: boolean) => {
+    recordingRef.current = value;
+    setRecording(value);
+  };
+
+  // Tap once to start recording, tap again to stop, transcribe on the server, then send.
   async function toggleRecording() {
     if (transcribing || sending || !token) return;
     try {
@@ -195,27 +240,25 @@ export default function ChatScreen() {
           Alert.alert('Permission needed', 'Allow microphone access to use voice input.');
           return;
         }
-        stopSpeaking();
+        stopSpeaking(); // don't record the phone reading a reply aloud
         await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
         await recorder.prepareToRecordAsync();
         recorder.record();
-        setRecording(true);
+        updateRecording(true);
         return;
       }
 
-      setRecording(false);
+      updateRecording(false);
       setTranscribing(true);
       await recorder.stop();
       await setAudioModeAsync({ allowsRecording: false }); // lets read-aloud use the speaker again
       const uri = recorder.uri;
       if (!uri) throw new Error('No recording was saved.');
 
-      const info = await FileSystem.getInfoAsync(uri);
-      console.log('recording file size:', info.exists ? (info as any).size : 'missing');
+      // The server expects the audio as base64 inside JSON.
       const audio = await FileSystem.readAsStringAsync(uri, {
         encoding: FileSystem.EncodingType.Base64,
       });
-      console.log('base64 length:', audio.length);
       const r = await fetch(`${BACKEND_URL}/api/transcribe`, {
         method: 'POST',
         headers: {
@@ -236,39 +279,21 @@ export default function ChatScreen() {
         Alert.alert('Nothing heard', 'Try again and speak a little closer to the mic.');
         return;
       }
-      const combined = input.trim() ? `${input.trim()} ${text}` : text;
-      sendMessage({ text: combined });
+      // Use the refs, not this function's captured values: the user may have typed more,
+      // toggled web search, or changed chats while we were transcribing.
+      const typed = inputRef.current.trim();
+      const combined = typed ? `${typed} ${text}` : text;
+      sendMessageRef.current({ text: combined });
     } catch (e: any) {
-      setRecording(false);
+      updateRecording(false);
       Alert.alert('Voice input failed', e.message);
     } finally {
       setTranscribing(false);
     }
   }
 
-  const [speakingId, setSpeakingId] = useState<string | null>(null);
-
-  const stopSpeaking = useCallback(() => {
-    Speech.stop();
-    setSpeakingId(null);
-  }, []);
-
-  const toggleSpeak = useCallback(
-  (id: string, text: string) => {
-    if (speakingId === id) {
-      stopSpeaking();
-      return;
-    }
-    Speech.stop();
-    const clean = cleanForSpeech(text).slice(0, Speech.maxSpeechInputLength - 1);
-    if (!clean) return;
-    const done = () => setSpeakingId((cur) => (cur === id ? null : cur));
-    setSpeakingId(id);
-    Speech.speak(clean, { language: 'en-US', onDone: done, onStopped: done, onError: done });
-  },
-  [speakingId, stopSpeaking],
-  );
-
+  // ---- Streaming control ----
+  // Invalidates the running stream (its callbacks become no-ops) and aborts the request.
   const abortStream = useCallback(() => {
     streamIdRef.current += 1;
     if (xhrRef.current) {
@@ -278,21 +303,29 @@ export default function ChatScreen() {
     setSending(false);
   }, []);
 
-  // Cancel any running stream when the screen unmounts.
+  // When the screen unmounts: cancel any running stream, stop reading aloud,
+  // and stop an active recording so the mic isn't left on.
   useEffect(
     () => () => {
       streamIdRef.current += 1;
       xhrRef.current?.abort();
+      Speech.stop();
+      if (recordingRef.current) {
+        recorder.stop().catch(() => {});
+      }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
+  // ---- Initial load: conversation list, then the newest conversation's messages ----
   useEffect(() => {
     (async () => {
       if (!token) return;
       try {
         let list = await apiFetch('/api/conversations', {}, token);
 
+        // First-time users get a starter chat.
         if (list.conversations.length === 0) {
           const created = await apiFetch(
             '/api/conversations',
@@ -306,6 +339,7 @@ export default function ChatScreen() {
         const id = list.conversations[0].id;
         setConversationId(id);
 
+        // loadSeqRef: if another load starts while this one is in flight, ignore this result.
         const seq = ++loadSeqRef.current;
         const msgs = await apiFetch(`/api/conversations/${id}/messages`, {}, token);
         if (seq === loadSeqRef.current) setMessages(msgs.messages.map(toMessage));
@@ -316,22 +350,23 @@ export default function ChatScreen() {
   }, [token]);
 
   async function openConversation(id: number) {
-  if (!token) return;
-  setDrawerOpen(false);
-  if (id === conversationId) return;
-  abortStream();
-  atBottomRef.current = true;          // <-- new: force auto-scroll on load
-  const seq = ++loadSeqRef.current;
-  try {
-    setConversationId(id);
-    setMessages([]);
-    const msgs = await apiFetch(`/api/conversations/${id}/messages`, {}, token);
-    if (seq === loadSeqRef.current) setMessages(msgs.messages.map(toMessage));
-  } catch (e: any) {
-    console.warn('Failed to open conversation:', e.message);
+    if (!token) return;
+    setDrawerOpen(false);
+    if (id === conversationId) return;
+    abortStream();
+    atBottomRef.current = true; // force auto-scroll to the bottom once the messages load
+    const seq = ++loadSeqRef.current;
+    try {
+      setConversationId(id);
+      setMessages([]);
+      const msgs = await apiFetch(`/api/conversations/${id}/messages`, {}, token);
+      if (seq === loadSeqRef.current) setMessages(msgs.messages.map(toMessage));
+    } catch (e: any) {
+      console.warn('Failed to open conversation:', e.message);
+    }
   }
-}
 
+  // ---- Create / rename / delete conversations ----
   function promptNewChat() {
     setDrawerOpen(false);
     setNameTargetId(null);
@@ -345,6 +380,7 @@ export default function ChatScreen() {
     setNameModalVisible(true);
   }
 
+  // Handles both "create" (nameTargetId === null) and "rename".
   async function submitName() {
     if (!token) return;
     const title = nameInput.trim();
@@ -358,7 +394,7 @@ export default function ChatScreen() {
           token,
         );
         abortStream();
-        loadSeqRef.current += 1;
+        loadSeqRef.current += 1; // cancels any in-flight message load for the previous chat
         setConversations((prev) => [created.conversation, ...prev]);
         setConversationId(created.conversation.id);
         setMessages([]);
@@ -402,6 +438,7 @@ export default function ChatScreen() {
       const remaining = conversationsRef.current.filter((c) => c.id !== id);
       setConversations(remaining);
 
+      // If the open chat was deleted, move to another one (or show the empty state).
       if (id === conversationId) {
         if (remaining.length > 0) {
           await openConversation(remaining[0].id);
@@ -415,6 +452,7 @@ export default function ChatScreen() {
     }
   }
 
+  // Re-fetches the list (so order and titles update after a reply). Failures are ignored on purpose.
   function refreshConversationList() {
     if (!token) return;
     apiFetch('/api/conversations', {}, token)
@@ -422,6 +460,7 @@ export default function ChatScreen() {
       .catch(() => {});
   }
 
+  // ---- Photos ----
   async function pickImage(source: 'camera' | 'library') {
     try {
       if (source === 'camera') {
@@ -439,11 +478,13 @@ export default function ChatScreen() {
 
       const asset = result.assets[0];
       // Shrink before upload: phone photos are huge, and the model only needs about 900px.
+      // Resizing only one side keeps the aspect ratio.
       const longest = Math.max(asset.width, asset.height);
       const actions =
         longest > MAX_IMAGE_SIDE
           ? [{ resize: asset.width >= asset.height ? { width: MAX_IMAGE_SIDE } : { height: MAX_IMAGE_SIDE } }]
           : [];
+      // Always re-encode as JPEG: the server only accepts JPEG.
       const out = await manipulateAsync(asset.uri, actions, {
         compress: 0.7,
         format: SaveFormat.JPEG,
@@ -464,6 +505,7 @@ export default function ChatScreen() {
     ]);
   }
 
+  // ---- Sending a message and reading the streamed reply ----
   function sendMessage(overrides?: { text?: string; image?: PendingImage | null }) {
     const text = (overrides?.text ?? input).trim();
     const img = overrides?.image !== undefined ? overrides.image : pendingImage;
@@ -474,6 +516,7 @@ export default function ChatScreen() {
       return;
     }
 
+    // Add the user's message and an empty assistant bubble that the stream will fill in.
     const stamp = Date.now();
     const assistantId = `${stamp}-a`;
     setMessages((prev) => [
@@ -490,6 +533,8 @@ export default function ChatScreen() {
     setPendingImage(null);
     setSending(true);
 
+    // Each stream gets a number. If the user stops it or switches chat, the number changes and
+    // every callback from this stream becomes a no-op via isStale().
     const myStream = ++streamIdRef.current;
     const isStale = () => myStream !== streamIdRef.current;
 
@@ -510,6 +555,7 @@ export default function ChatScreen() {
       pending = '';
       setMessages((prev) => {
         const i = prev.length - 1;
+        // Only touch the last message, and only if it is still our assistant bubble.
         if (i < 0 || prev[i].id !== assistantId) return prev;
         const copy = prev.slice();
         copy[i] = { ...prev[i], content: prev[i].content + add };
@@ -522,6 +568,7 @@ export default function ChatScreen() {
       if (!timer) timer = setTimeout(flush, FLUSH_INTERVAL_MS);
     };
 
+    // Shows an error inside the assistant bubble (after any text that already arrived).
     const showError = (msg: string) => {
       flush();
       if (isStale()) return;
@@ -532,6 +579,7 @@ export default function ChatScreen() {
       );
     };
 
+    // XMLHttpRequest is used instead of fetch because React Native's fetch cannot stream.
     const xhr = new XMLHttpRequest();
     xhrRef.current = xhr;
     let lastLength = 0;
@@ -573,6 +621,7 @@ export default function ChatScreen() {
     xhr.onerror = () => showError("Couldn't reach the server (network error)");
     xhr.ontimeout = () => showError('The request timed out');
 
+    // Runs after success, error, timeout or abort.
     xhr.onloadend = () => {
       if (isStale()) return; // cancelled or replaced: leave state alone
       processProgress();
@@ -603,25 +652,25 @@ export default function ChatScreen() {
     );
   }
 
-  const lastId = messages[messages.length - 1]?.id;
-
+  // The list item renderer only changes when something a bubble needs actually changes.
   const renderItem = useCallback(
-  ({ item }: { item: Message }) => (
-    <MessageBubble
-      id={item.id}
-      role={item.role}
-      content={item.content}
-      imageUri={item.imageUri}
-      hasImage={item.hasImage}
-      token={token}
-      canSpeak={item.role === 'assistant'}
-      speaking={speakingId === item.id}
-      onSpeak={toggleSpeak}
-    />
-  ),
-  [token, speakingId, toggleSpeak],
-);
+    ({ item }: { item: Message }) => (
+      <MessageBubble
+        id={item.id}
+        role={item.role}
+        content={item.content}
+        imageUri={item.imageUri}
+        hasImage={item.hasImage}
+        token={token}
+        canSpeak={item.role === 'assistant'}
+        speaking={speakingId === item.id}
+        onSpeak={toggleSpeak}
+      />
+    ),
+    [token, speakingId, toggleSpeak],
+  );
 
+  // Show "Thinking…" from sending until the first token arrives.
   const waitingForFirstToken = sending && messages[messages.length - 1]?.content === '';
 
   return (
@@ -649,7 +698,7 @@ export default function ChatScreen() {
         <KeyboardAvoidingView
           style={styles.flex}
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 80 : 0}>
+          keyboardVerticalOffset={Platform.OS === 'ios' ? KEYBOARD_OFFSET_IOS : 0}>
           <FlatList
             ref={listRef}
             data={messages}
@@ -659,6 +708,7 @@ export default function ChatScreen() {
             onScroll={onScroll}
             scrollEventThrottle={16}
             onContentSizeChange={() => {
+              // Follow new text only while the user is already at the bottom.
               if (atBottomRef.current) {
                 listRef.current?.scrollToEnd({ animated: false });
               }
@@ -707,6 +757,7 @@ export default function ChatScreen() {
               style={[styles.input, { color: colors.text }]}
               multiline
             />
+            {/* While a reply is streaming this button becomes "Stop" */}
             <Pressable
               onPress={sending ? abortStream : () => sendMessage()}
               disabled={!sending && !input.trim() && !pendingImage}
@@ -743,6 +794,7 @@ export default function ChatScreen() {
                   </ThemedText>
                 </Pressable>
 
+                {/* "⋯" menu: rename or delete */}
                 <Pressable
                   onPress={() =>
                     Alert.alert(item.title, undefined, [
