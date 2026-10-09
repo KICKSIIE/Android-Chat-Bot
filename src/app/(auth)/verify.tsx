@@ -3,23 +3,26 @@ import { Link, useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
-const RESEND_SECONDS = 60;
+const RESEND_SECONDS = 60; // matches the server's resend cooldown
 
 export default function VerifyScreen() {
   const { verifyEmail, resendVerification } = useAuth();
   const router = useRouter();
+  // The email comes from the previous screen (signup or login)
   const { email } = useLocalSearchParams<{ email?: string }>();
 
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [cooldown, setCooldown] = useState(RESEND_SECONDS); // a code was just sent
 
+  // Count the resend timer down once per second
   useEffect(() => {
     if (cooldown <= 0) return;
     const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
     return () => clearTimeout(t);
   }, [cooldown]);
 
+  // Opened without an email (e.g. directly): nothing to verify
   if (!email) {
     return (
       <View style={styles.container}>
@@ -31,6 +34,7 @@ export default function VerifyScreen() {
     );
   }
 
+  // Check the code; on success the user is signed in and sent to the chat
   async function onVerify() {
     if (code.length !== 6) {
       Alert.alert('Code', 'Enter the 6-digit code from your email.');
@@ -47,6 +51,7 @@ export default function VerifyScreen() {
     }
   }
 
+  // Ask for a new code (only allowed once the timer reaches 0)
   async function onResend() {
     if (cooldown > 0) return;
     try {
@@ -65,6 +70,7 @@ export default function VerifyScreen() {
         We sent a 6-digit code to {email}. It expires in 10 minutes.
       </Text>
 
+      {/* Digits only, max 6. The autofill props let the phone suggest the code from the email/SMS. */}
       <TextInput
         placeholder="123456"
         value={code}

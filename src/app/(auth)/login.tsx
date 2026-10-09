@@ -46,6 +46,7 @@ export default function LoginScreen() {
         onChangeText={setEmail}
         style={styles.input}
       />
+      {/* Pressing "enter" on the keyboard submits the form */}
       <TextInput
         placeholder="Password"
         secureTextEntry

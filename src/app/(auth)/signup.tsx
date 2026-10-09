@@ -3,6 +3,7 @@ import { Link, useRouter } from 'expo-router';
 import { useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
+// Basic email shape check (the server checks again)
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export default function SignupScreen() {
@@ -16,6 +17,8 @@ export default function SignupScreen() {
   async function onSubmit() {
     const name = username.trim();
     const cleanEmail = email.trim().toLowerCase();
+
+    // Quick checks before calling the server
     if (!name || !cleanEmail || !password) {
       Alert.alert('Missing fields', 'Fill in all fields.');
       return;
@@ -32,9 +35,11 @@ export default function SignupScreen() {
       Alert.alert('Weak password', 'Use at least 8 characters.');
       return;
     }
+
     setBusy(true);
     try {
       await signUp(name, cleanEmail, password);
+      // The account exists but isn't verified yet: go enter the emailed code
       router.push({ pathname: '/(auth)/verify', params: { email: cleanEmail } });
     } catch (e: any) {
       Alert.alert('Signup failed', e.message);
@@ -57,6 +62,7 @@ export default function SignupScreen() {
         onChangeText={setEmail}
         style={styles.input}
       />
+      {/* "new-password" lets the phone offer to generate and save a password */}
       <TextInput
         placeholder="Password (min 8 chars)"
         secureTextEntry

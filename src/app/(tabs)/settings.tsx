@@ -16,6 +16,7 @@ import { ThemedView } from '@/components/themed-view';
 import { Colors, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useAuth } from '@/lib/auth-context';
 
+// 'idle' = showing the first form, 'code' = waiting for the emailed code
 type Step = 'idle' | 'code';
 
 export default function SettingsScreen() {
@@ -31,6 +32,7 @@ export default function SettingsScreen() {
   const scheme = useColorScheme();
   const colors = Colors[scheme === 'dark' ? 'dark' : 'light'];
 
+  // Which action is running right now (null = none). Used to disable buttons and show a spinner.
   const [busy, setBusy] = useState<string | null>(null);
 
   // username
@@ -47,6 +49,7 @@ export default function SettingsScreen() {
   const [currentPassword, setCurrentPassword] = useState('');
   const [emCode, setEmCode] = useState('');
 
+  // Runs an action with a busy flag, and shows any error in an alert.
   async function run(key: string, fn: () => Promise<void>) {
     setBusy(key);
     try {
@@ -66,6 +69,7 @@ export default function SettingsScreen() {
       Alert.alert('Saved', 'Your username was updated.');
     });
 
+  // Password step 1: email a code to the current address
   const sendPasswordCode = () =>
     run('pw-send', async () => {
       await requestPasswordCode();
@@ -73,17 +77,20 @@ export default function SettingsScreen() {
       Alert.alert('Code sent', `We emailed a 6-digit code to ${user?.email}.`);
     });
 
+  // Password step 2: check the code and set the new password
   const confirmPassword = () =>
     run('pw-confirm', async () => {
       if (pwCode.length !== 6) throw new Error('Enter the 6-digit code.');
       if (newPassword.length < 8) throw new Error('New password must be at least 8 characters.');
       await changePassword(pwCode, newPassword);
+      // Reset the form
       setPwStep('idle');
       setPwCode('');
       setNewPassword('');
       Alert.alert('Password changed', 'Other devices have been signed out.');
     });
 
+  // Email step 1: needs the current password, then emails a code to the NEW address
   const sendEmailCode = () =>
     run('em-send', async () => {
       if (!newEmail.trim()) throw new Error('Enter the new email address.');
@@ -93,10 +100,12 @@ export default function SettingsScreen() {
       Alert.alert('Code sent', `We emailed a 6-digit code to ${newEmail.trim().toLowerCase()}.`);
     });
 
+  // Email step 2: check the code and switch the account email
   const confirmEmail = () =>
     run('em-confirm', async () => {
       if (emCode.length !== 6) throw new Error('Enter the 6-digit code.');
       await changeEmail(emCode);
+      // Reset the form
       setEmStep('idle');
       setNewEmail('');
       setCurrentPassword('');
@@ -104,6 +113,7 @@ export default function SettingsScreen() {
       Alert.alert('Email changed', 'Your account email was updated.');
     });
 
+  // Disable every button while any action is running
   const disabled = busy !== null;
 
   return (
@@ -125,6 +135,7 @@ export default function SettingsScreen() {
             <Btn label="Email me a code" onPress={sendPasswordCode} disabled={disabled} busy={busy === 'pw-send'} />
           ) : (
             <>
+              {/* Digits only, max 6 */}
               <Field
                 colors={colors}
                 value={pwCode}
@@ -170,10 +181,12 @@ export default function SettingsScreen() {
   );
 }
 
+// Text input with the app's border and theme text color
 function Field({ colors, ...props }: TextInputProps & { colors: { text: string } }) {
   return <TextInput placeholderTextColor="#888" {...props} style={[styles.input, { color: colors.text }]} />;
 }
 
+// Button: dark by default, outlined when `secondary`. Shows a spinner while `busy`.
 function Btn({
   label,
   onPress,
@@ -191,6 +204,7 @@ function Btn({
     <Pressable
       onPress={onPress}
       disabled={disabled}
+      // Fade the other buttons while one is busy, but keep the busy one fully visible
       style={[styles.button, secondary ? styles.buttonSecondary : styles.buttonPrimary, disabled && !busy && { opacity: 0.5 }]}>
       {busy ? (
         <ActivityIndicator color={secondary ? undefined : '#fff'} />
